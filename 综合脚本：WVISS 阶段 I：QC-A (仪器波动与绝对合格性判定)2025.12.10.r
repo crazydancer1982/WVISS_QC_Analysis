@@ -5,21 +5,23 @@
 # ----------------------------------------------------------------------
 
 # 0. 环境设置与库加载
-# 确保已安装：dplyr, tidyr, zoo, RcppRoll
+# 确保已安装：dplyr, tidyr, zoo, RcppRoll, latex2exp
 if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
 if (!requireNamespace("tidyr", quietly = TRUE)) install.packages("tidyr")
 if (!requireNamespace("zoo", quietly = TRUE)) install.packages("zoo")
 if (!requireNamespace("RcppRoll", quietly = TRUE)) install.packages("RcppRoll")
+if (!requireNamespace("latex2exp", quietly = TRUE)) install.packages("latex2exp")
 
 library(dplyr)
 library(tidyr)
 library(zoo)
 library(RcppRoll)
+library(latex2exp)
 
 # 设置有效数字位数
 options("digits" = 9) 
 
-# --- 全局 QC-A 参数设定 (采用最终折衷方案的推荐值) ---
+# --- 全局 QC-A 参数设定 (采用您的参数) ---
 N_WINDOW <- 270     # 窗口长度 N* (Cycles)
 K_CL_SIGMA <- 3     # 动态 CL 阈值 K (K*MAD)
 K_STEP <- 5         # 步长 k* (Cycles)
@@ -31,39 +33,72 @@ robust_mad <- function(x) {
   mad(x, center = median(x, na.rm = TRUE), constant = 1.4826, na.rm = TRUE)
 }
 
-
-# 0.2 定义稀疏滚动 MAD 函数 (用于高效计算 CL)
-calculate_sparse_rolling_mad <- function(data_vector, window_n, k_step) {
-  L <- length(data_vector)
-  sparse_mad <- rep(NA_real_, L)
+# ----------------------------------------------------------------------
+# 0.2 定义稀疏滚动统计量函数 (统一处理 Median 和 MAD)
+# 作用：每 K_STEP 步计算一次滚动统计量，并对结果进行向前填充 (LOCF)。
+# ----------------------------------------------------------------------
+calculate_sparse_rolling_stats <- function(data_vector, N_window, K_step) {
   
-  # 确定计算的索引：从 N_WINDOW 开始，每隔 k_step 计算一次
-  start_idx <- N_WINDOW
-
-  indices_to_calc <- seq(start_idx, L, by = k_step)
-
-  for (i in indices_to_calc) {
-    window_data <- data_vector[(i - window_n + 1):i]
-    mad_val <- robust_mad(window_data)
-    sparse_mad[i] <- mad_val
-  }
-
-  # 【增强逻辑 1: 处理序列开始 (1 到 window_n - 1)】
-  if (L >= window_n && window_n > 1) {
-    first_mad_val <- sparse_mad[window_n]
-    # 采用第一个完整窗口的值进行回填
-    if (!is.na(first_mad_val)) {
-      sparse_mad[1:(window_n - 1)] <- first_mad_val
-    }
-  }
-
-  # 使用 Last Observation Carried Forward (na.locf) 填充 NA
-  sparse_mad <- zoo::na.locf(sparse_mad, na.rm = FALSE)
-  return(sparse_mad)
+  L_full <- length(data_vector)
+  
+  # 1. 使用 K_step 进行稀疏滚动计算 (生成短向量)
+  # rollapply(..., by = K_step) ensures sparse calculation
+  
+  # 计算稀疏 Median
+  sparse_median <- zoo::rollapply(
+    data = data_vector, 
+    width = N_window, 
+    FUN = median, 
+    by = K_step, 
+    align = "right", 
+    fill = NA, 
+    na.rm = TRUE
+  )
+  
+  # 计算稀疏 MAD (使用自定义的 robust_mad 函数)
+  sparse_mad <- zoo::rollapply(
+    data = data_vector, 
+    width = N_window, 
+    FUN = robust_mad, 
+    by = K_step, 
+    align = "right", 
+    fill = NA, 
+    na.rm = TRUE
+  )
+  
+  # 2. 将稀疏结果映射回原始长度向量（在更新点赋值，其余为 NA）
+  
+  # rollapply (align="right", fill=NA) 会在 N_window 处给出第一个值
+  # 后续的计算点是 N_window, N_window + K_step, N_window + 2*K_step, ...
+  start_index <- N_window
+  
+  # 确定稀疏值在完整向量中的落点索引
+  # 确保索引长度与稀疏结果长度一致
+  calculated_indices <- seq(start_index, L_full, by = K_step)[1:length(sparse_median)]
+  
+  # 创建原始长度的 NA 向量
+  full_median_na <- rep(NA_real_, L_full)
+  full_mad_na <- rep(NA_real_, L_full)
+  
+  # 在计算点上赋值
+  full_median_na[calculated_indices] <- coredata(sparse_median)
+  full_mad_na[calculated_indices] <- coredata(sparse_mad)
+  
+  # 3. 使用 LOCF（Last Observation Carried Forward）进行向前填充
+  # 这确保了周期 i 采用最近的、基于 k 步长计算出的 CL 值
+  final_median <- zoo::na.locf(full_median_na, na.rm = FALSE)
+  final_mad <- zoo::na.locf(full_mad_na, na.rm = FALSE)
+  
+  # 4. 确保前 N_window-1 个 Cycle 仍为 NA (因为窗口未满)
+  final_median[1:(N_window - 1)] <- NA_real_
+  final_mad[1:(N_window - 1)] <- NA_real_
+  
+  return(list(Rolling_Median = final_median, Rolling_MAD = final_mad))
 }
 
+
 # ======================================================================
-# 1. 数据加载与预处理
+# 1. 数据加载与预处理 (保持不变)
 # ======================================================================
 
 # 设置工作路径
@@ -130,7 +165,7 @@ message("数据预处理和中心化计算完成。")
 
 
 # ======================================================================
-# 2. QC-A 核心指标计算：Cycle-Level 统计与 Z-Composite
+# 2. QC-A 核心指标计算：Cycle-Level 统计与 Z-Composite (保持不变)
 # ======================================================================
 
 # --- 2.1 Cycle-Level 变异性指标计算 (QC-A 基础数据) ---
@@ -171,32 +206,39 @@ df_qc_a <- df_cycle_metrics %>%
     #Z_H2O_abs = (H_Zscore_Mean_abs - global_stats$H_Z_Median) / global_stats$H_Z_MAD,
     
     # Z-Composite = max(Z_SD, Z_H2O_abs) (取最大值作为最差情况)
-    Z_Composite_D = Z_SD_D
+    Z_Composite_D = Z_SD_D,
     Z_Composite_O18 = Z_SD_O18
   )
 
-head(as.data.frame(df_qc_a))
 # ======================================================================
-# 3. 阈值计算与 Outlier 判定
+# 3. 阈值计算与 Outlier 判定 (更新：CL 稀疏滚动逻辑)
 # ======================================================================
 
-# --- 3.1 动态控制限 (CL) 计算 ---
-# CL = Rolling Median + K_CL_SIGMA * Rolling MAD
+# --- 3.1 动态控制限 (CL) 和静态规格限 (SL) 计算 ---
+# 使用 K_STEP=5 的稀疏更新逻辑
+message("开始计算稀疏滚动统计量 (N=270, k*=5) ...")
+
+results_D <- calculate_sparse_rolling_stats(df_qc_a$Z_Composite_D, N_WINDOW, K_STEP)
+results_O18 <- calculate_sparse_rolling_stats(df_qc_a$Z_Composite_O18, N_WINDOW, K_STEP)
+
 df_qc_a <- df_qc_a %>%
+  # 添加 SL 辅助列 (值为固定阈值 K_SL_SIGMA=5) 用于绘图
   mutate(
-    # 滚动中位数 (Rolling Median) - 用于趋势拟合
-    Rolling_Median_D = roll_median(Z_Composite_D, n = N_WINDOW, align = "right", fill = NA, na.rm = TRUE),
-    Rolling_Median_O18 = roll_median(Z_Composite_O18, n = N_WINDOW, align = "right", fill = NA, na.rm = TRUE)
-  ) %>%
-  mutate(
-    # 稀疏滚动 MAD (Rolling MAD) - 用于局部波动性估计
-    Rolling_MAD_D = calculate_sparse_rolling_mad(Z_Composite_D, N_WINDOW, K_STEP),
-    Rolling_MAD_O18 = calculate_sparse_rolling_mad(Z_Composite_O18, N_WINDOW, K_STEP),
+    SL_D = K_SL_SIGMA,
+    SL_O18 = K_SL_SIGMA,
+    
+    # 稀疏滚动统计量 (步长 k*=5)
+    Rolling_Median_D = results_D$Rolling_Median,
+    Rolling_MAD_D = results_D$Rolling_MAD,
+    Rolling_Median_O18 = results_O18$Rolling_Median,
+    Rolling_MAD_O18 = results_O18$Rolling_MAD,
     
     # 动态控制限 (CL)
     CL_D = Rolling_Median_D + K_CL_SIGMA * Rolling_MAD_D,
     CL_O18 = Rolling_Median_O18 + K_CL_SIGMA * Rolling_MAD_O18
   )
+message("动态 CL 和静态 SL 辅助列计算完成。")
+
 
 # --- 3.2 Outlier 判定逻辑 ---
 # 判定逻辑：Outlier = 超过 SL (静态规格限) OR 超过 CL (动态控制限)
@@ -221,14 +263,14 @@ df_qc_a <- df_qc_a %>%
 
 
 # ======================================================================
-# 4. 输出结果与统计摘要
+# 4. 输出结果与统计摘要 (保持不变)
 # ======================================================================
 
 str(df_qc_a)
 table(df_qc_a$CL_D_Outlier)
 message("\n--- 阶段 I：QC-A 质控结果 (部分展示) ---")
 print(head(df_qc_a %>% 
-             select(group.id, year, Cycle_Seq, Z_Composite_D, CL_D, K_SL_SIGMA, Total_D_Outlier, QC_A_Cycle_Outlier), 
+             select(group.id, year, Cycle_Seq, Z_Composite_D, CL_D, SL_D, Total_D_Outlier, QC_A_Cycle_Outlier), 
            20))
 
 message(paste0("\n--- 质控参数摘要：N=", N_WINDOW, ", K_CL=", K_CL_SIGMA, ", K_STEP=", K_STEP, ", K_SL=", K_SL_SIGMA, " ---"))
@@ -265,11 +307,10 @@ print(df_cl_summary)
 
 
 
-####### plot 
+####### plot (保持不变，但依赖于 3.1 节新增的 SL_D/SL_O18 列)
 
 # --- 0. 确保加载所需的库 (如果尚未加载) ---
-if (!requireNamespace("latex2exp", quietly = TRUE)) install.packages("latex2exp")
-library(latex2exp)
+# 已在顶部加载 library(latex2exp)
 
 # --- 1. 定义增强的 Base R 绘图函数 (英文标签) ---
 # 绘制 Z_Composite 的时间序列，并标注 CL 和 SL 阈值
@@ -279,11 +320,12 @@ plot_z_time_series_base_r <- function(data, Z_col, CL_col, SL_col,
   # Data extraction
   Z_data <- data[[Z_col]]
   CL_data <- data[[CL_col]]
-  SL_threshold_value <- unique(data[[SL_col]])[1]
+  # 从数据框中获取 SL 值，它现在应该是一个固定值 K_SL_SIGMA
+  SL_threshold_value <- unique(data[[SL_col]])[1] 
   Cycle_Seq <- data$Cycle_Seq
   
   # Outlier detection logic: Exceeding CL OR Exceeding SL
-  is_outlier <- Z_data > CL_data | Z_data > SL_threshold_value
+  is_outlier <- data[[paste0("Total_", substr(Z_col, nchar(Z_col), nchar(Z_col)), "_Outlier")]]
   is_normal <- !is_outlier
   
   # Set up plot margins
@@ -349,13 +391,13 @@ plot_z_time_series_base_r <- function(data, Z_col, CL_col, SL_col,
   # SL Annotation
   text(x = max_seq * 0.95, 
        y = SL_threshold_value + 0.06 * diff(par("usr")[3:4]), # Offset slightly from the line
-       labels = bquote(SL: ~ Median["Global"] + .(K_SL_SIGMA) * MAD["Global"]),
+       labels = bquote(SL: ~ .(K_SL_SIGMA) * sigma), # SL in Z-score is simply K_SL_SIGMA
        col = "red", 
        adj = c(1, 0), # Right-align, bottom-align
        cex = 0.8)
   
   # Title Subtitle (Static/Dynamic Thresholds)
-  mtext(paste0("CL (Dynamic): Rolling Median + ", K_CL_SIGMA, "*MAD | SL (Static): Global Median + ", K_SL_SIGMA, "*MAD"), 
+  mtext(paste0("CL (Dynamic): Rolling Median + ", K_CL_SIGMA, "*MAD | SL (Static): ", K_SL_SIGMA, "*Sigma"), 
         side = 3, line = 0.5, cex = 0.9)
 
   # 7. Add Legend - NEW
@@ -382,18 +424,12 @@ plot_z_time_series_base_r <- function(data, Z_col, CL_col, SL_col,
 
 
 # --- 2. 假设 df_qc_a 数据框已存在 (您的 QC-A 脚本执行结果) ---
-# **重要：请确保在运行此绘图脚本之前，您已成功运行 QC-A 脚本并生成了 df_qc_a**
-# 为了让这段代码能够运行，我保留了原有的结构。
-K_CL_SIGMA_VALUE <- 3 # 保持您的默认值
+K_CL_SIGMA_VALUE <- K_CL_SIGMA
 
 if (exists("df_qc_a")) {
   
   # 提取 K_SL_SIGMA (如果存在)
-  K_SL_SIGMA_VALUE <- unique(df_qc_a$K_SL_SIGMA)[1]
-  if (is.null(K_SL_SIGMA_VALUE) || is.na(K_SL_SIGMA_VALUE)) {
-    # Fallback to default if not found in data frame
-    K_SL_SIGMA_VALUE <- 5 
-  }
+  K_SL_SIGMA_VALUE <- K_SL_SIGMA
   
   OUTPUT_DIR <- "./WVISS_QC_Plots"
   if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR)
@@ -404,7 +440,7 @@ if (exists("df_qc_a")) {
     data = df_qc_a,
     Z_col = "Z_Composite_D",
     CL_col = "CL_D", 
-    SL_col = "SL_D", 
+    SL_col = "SL_D", # 使用新增的 SL_D 列
     K_SL_SIGMA = K_SL_SIGMA_VALUE,
     K_CL_SIGMA = K_CL_SIGMA_VALUE,
     # Use expression for the Y-axis label (dD)
@@ -420,7 +456,7 @@ if (exists("df_qc_a")) {
     data = df_qc_a,
     Z_col = "Z_Composite_O18",
     CL_col = "CL_O18", 
-    SL_col = "SL_O18", 
+    SL_col = "SL_O18", # 使用新增的 SL_O18 列
     K_SL_SIGMA = K_SL_SIGMA_VALUE,
     K_CL_SIGMA = K_CL_SIGMA_VALUE,
     # Use expression for the Y-axis label (d18O)
